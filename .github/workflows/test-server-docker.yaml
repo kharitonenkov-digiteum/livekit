@@ -13,7 +13,7 @@
 # limitations under the License.
 
 # Builds and publishes the SDK conformance test server (cmd/test-server) to
-# Docker Hub as livekit/test-server:latest on every push to master. The server
+# Docker Hub as khariton80/test-server:latest on every push to master. The server
 # SDK repos boot this image in their CI to run region-failover tests.
 name: Release Test Server to Docker
 
@@ -50,4 +50,4 @@ jobs:
           platforms: linux/amd64,linux/arm64
           # Each build overrides the latest tag so SDK CI always boots the
           # current mock server.
-          tags: livekit/test-server:latest
+          tags: khariton80/test-server:latest
