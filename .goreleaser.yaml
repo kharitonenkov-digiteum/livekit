@@ -42,7 +42,7 @@ archives:
       - LICENSE
 release:
   github:
-    owner: livekit
+    owner: kharitonenkov-digiteum
     name: livekit
   draft: true
   prerelease: auto
