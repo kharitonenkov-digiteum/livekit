@@ -49,4 +49,5 @@ var (
 	ErrNoConnectRequest                 = psrpc.NewErrorf(psrpc.InvalidArgument, "no connect request")
 	ErrNoConnectResponse                = psrpc.NewErrorf(psrpc.InvalidArgument, "no connect response")
 	ErrDestinationIdentityRequired      = psrpc.NewErrorf(psrpc.InvalidArgument, "destination identity is required")
+	ErrMoveCrossNodeNotSupported        = psrpc.NewErrorf(psrpc.FailedPrecondition, "destination room is hosted on a different node; cross-node MoveParticipant is not supported")
 )

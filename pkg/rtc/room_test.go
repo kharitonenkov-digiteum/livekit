@@ -868,6 +868,92 @@ func TestRoomUpdate(t *testing.T) {
 	})
 }
 
+func TestMoveParticipant(t *testing.T) {
+	t.Run("removes participant from source room without closing it", func(t *testing.T) {
+		srcRoom := newRoomWithParticipants(t, testRoomOpts{num: 1})
+		defer srcRoom.Close(types.RoomCloseReasonUnknown)
+
+		p := srcRoom.GetParticipants()[0].(*typesfakes.FakeLocalParticipant)
+		track := NewMockTrack(livekit.TrackType_VIDEO, "cam")
+		track.IsOpenReturns(true)
+		p.GetPublishedTracksReturns([]types.MediaTrack{track})
+
+		movedParticipant, requestSource, opts := srcRoom.RemoveParticipantForMove(p.Identity())
+		require.Equal(t, types.LocalParticipant(p), movedParticipant)
+		require.NotNil(t, opts)
+		require.Nil(t, requestSource)
+
+		require.Empty(t, srcRoom.GetParticipants())
+		require.Nil(t, srcRoom.trackManager.GetTrackInfo(track.ID()))
+		require.Equal(t, 0, p.CloseCallCount())
+	})
+
+	t.Run("returns a nil participant when it is not (or no longer) in the room", func(t *testing.T) {
+		srcRoom := newRoomWithParticipants(t, testRoomOpts{num: 1})
+		defer srcRoom.Close(types.RoomCloseReasonUnknown)
+
+		movedParticipant, requestSource, opts := srcRoom.RemoveParticipantForMove("nonexistent")
+		require.Nil(t, movedParticipant)
+		require.Nil(t, requestSource)
+		require.Nil(t, opts)
+	})
+
+	t.Run("adds participant to destination room, cross-subscribing it with existing publishers", func(t *testing.T) {
+		srcRoom := newRoomWithParticipants(t, testRoomOpts{num: 1})
+		defer srcRoom.Close(types.RoomCloseReasonUnknown)
+		destRoom := newRoomWithParticipants(t, testRoomOpts{num: 0})
+		defer destRoom.Close(types.RoomCloseReasonUnknown)
+
+		existingDestParticipant := NewMockParticipant("existing", types.CurrentProtocol, false, true, destRoom.LocalParticipantListener())
+		require.NoError(t, destRoom.Join(existingDestParticipant, nil, &ParticipantOptions{AutoSubscribe: true}, iceServersForRoom))
+		existingDestParticipant.StateReturns(livekit.ParticipantInfo_ACTIVE)
+		existingDestParticipant.GetPublishedTracksReturns([]types.MediaTrack{NewMockTrack(livekit.TrackType_VIDEO, "existingcam")})
+
+		mover := srcRoom.GetParticipants()[0].(*typesfakes.FakeLocalParticipant)
+		moverTrack := NewMockTrack(livekit.TrackType_VIDEO, "movercam")
+		moverTrack.IsOpenReturns(true)
+		mover.GetPublishedTracksReturns([]types.MediaTrack{moverTrack})
+
+		_, _, opts := srcRoom.RemoveParticipantForMove(mover.Identity())
+		require.NotNil(t, opts)
+
+		err := destRoom.AddParticipantForMove(mover, opts, nil)
+		require.NoError(t, err)
+
+		require.Len(t, destRoom.GetParticipants(), 2)
+		require.NotNil(t, destRoom.trackManager.GetTrackInfo(moverTrack.ID()))
+
+		// the destination room's existing participant should be subscribed to the mover's track
+		require.Equal(t, 1, existingDestParticipant.SubscribeToTrackCallCount())
+		subTrackID, _ := existingDestParticipant.SubscribeToTrackArgsForCall(0)
+		require.Equal(t, moverTrack.ID(), subTrackID)
+
+		// the mover should be subscribed to the destination room's existing publisher's track
+		require.Equal(t, 1, mover.SubscribeToTrackCallCount())
+	})
+
+	t.Run("rejects a duplicate identity already present in the destination room", func(t *testing.T) {
+		destRoom := newRoomWithParticipants(t, testRoomOpts{num: 0})
+		defer destRoom.Close(types.RoomCloseReasonUnknown)
+
+		p := NewMockParticipant("dup", types.CurrentProtocol, false, false, destRoom.LocalParticipantListener())
+		require.NoError(t, destRoom.Join(p, nil, &ParticipantOptions{AutoSubscribe: true}, iceServersForRoom))
+
+		dup := NewMockParticipant("dup", types.CurrentProtocol, false, false, destRoom.LocalParticipantListener())
+		err := destRoom.AddParticipantForMove(dup, &ParticipantOptions{AutoSubscribe: true}, nil)
+		require.ErrorIs(t, err, ErrAlreadyJoined)
+	})
+
+	t.Run("rejects a move into a closed room", func(t *testing.T) {
+		destRoom := newRoomWithParticipants(t, testRoomOpts{num: 0})
+		destRoom.Close(types.RoomCloseReasonUnknown)
+
+		p := NewMockParticipant("mover", types.CurrentProtocol, false, false, destRoom.LocalParticipantListener())
+		err := destRoom.AddParticipantForMove(p, &ParticipantOptions{AutoSubscribe: true}, nil)
+		require.ErrorIs(t, err, ErrRoomClosed)
+	})
+}
+
 type testRoomOpts struct {
 	num                  int
 	numHidden            int

@@ -788,7 +788,17 @@ func (r *RoomManager) rtcSessionWorker(room *rtc.Room, participant types.LocalPa
 
 		case obj := <-requestSource.ReadChan():
 			if obj == nil {
-				if room.GetParticipantRequestSource(participant.Identity()) == requestSource {
+				// participant may have been moved to a different room since this goroutine
+				// started (MoveParticipant keeps the signaling connection alive across the
+				// move), so re-resolve the room actually holding this request source instead
+				// of relying on the room captured at session start.
+				closeCheckRoom := room
+				if currentRoomName := livekit.RoomName(participant.ClaimGrants().Video.Room); currentRoomName != room.Name() {
+					if movedRoom := r.GetRoom(context.Background(), currentRoomName); movedRoom != nil {
+						closeCheckRoom = movedRoom
+					}
+				}
+				if closeCheckRoom.GetParticipantRequestSource(participant.Identity()) == requestSource {
 					participant.HandleSignalSourceClose()
 				}
 				return
@@ -913,8 +923,188 @@ func (r *RoomManager) ForwardParticipant(ctx context.Context, req *livekit.Forwa
 	return nil, errors.New("not implemented")
 }
 
+// MoveParticipant moves a participant from the room hosting this call (the source room, which
+// is always local to this node -- RoomService.MoveParticipant psrpc-dispatches here via the
+// source participant's topic) into a destination room, without dropping the participant's
+// existing signaling connection or peer connections. Only same-node moves are supported: if the
+// destination room already exists on a different node, this returns ErrMoveCrossNodeNotSupported
+// rather than attempting anything cross-node.
 func (r *RoomManager) MoveParticipant(ctx context.Context, req *livekit.MoveParticipantRequest) (*livekit.MoveParticipantResponse, error) {
-	return nil, errors.New("not implemented")
+	if req.Room == req.DestinationRoom {
+		return nil, ErrDestinationSameAsSourceRoom
+	}
+
+	srcRoom, participant, err := r.roomAndParticipantForReq(ctx, req)
+	if err != nil {
+		return nil, err
+	}
+
+	if err := participant.SupportsMoving(); err != nil {
+		return nil, err
+	}
+
+	destRoomName := livekit.RoomName(req.DestinationRoom)
+	destRoom, err := r.resolveDestinationRoomForMove(ctx, destRoomName)
+	if err != nil {
+		return nil, err
+	}
+	defer destRoom.Release()
+
+	pLogger := participant.GetLogger()
+
+	if destRoom.GetParticipant(participant.Identity()) != nil {
+		return nil, rtc.ErrAlreadyJoined
+	}
+
+	movedParticipant, requestSource, opts := srcRoom.RemoveParticipantForMove(participant.Identity())
+	if movedParticipant == nil {
+		return nil, ErrParticipantNotFound
+	}
+
+	pLogger.Infow("moving participant to new room", "srcRoom", srcRoom.Name(), "destRoom", destRoomName)
+
+	r.moveParticipantToRoom(destRoom, movedParticipant)
+
+	if err := destRoom.AddParticipantForMove(movedParticipant, opts, requestSource); err != nil {
+		pLogger.Errorw("could not add moved participant to destination room, rolling back to source room", err, "destRoom", destRoomName)
+		r.moveParticipantToRoom(srcRoom, movedParticipant)
+		if rollbackErr := srcRoom.AddParticipantForMove(movedParticipant, opts, requestSource); rollbackErr != nil {
+			pLogger.Errorw("rollback to source room failed; participant is now orphaned from all rooms", rollbackErr)
+		} else {
+			movedParticipant.JoinSession(func() {
+				r.bindMovedParticipant(ctx, srcRoom, movedParticipant)
+			})
+		}
+		return nil, err
+	}
+
+	// JoinSession pairs with the LeaveSession that MoveToRoom ran above: it reports the join,
+	// then re-reports the participant's already-published tracks as published under the new
+	// session, balancing the unpublish LeaveSession already reported for the old one.
+	movedParticipant.JoinSession(func() {
+		r.bindMovedParticipant(ctx, destRoom, movedParticipant)
+	})
+
+	token, err := r.buildParticipantToken(movedParticipant)
+	if err != nil {
+		pLogger.Errorw("could not build token for moved participant", err)
+		return nil, err
+	}
+
+	otherParticipants := make([]*livekit.ParticipantInfo, 0, destRoom.GetParticipantCount())
+	for _, p := range destRoom.GetParticipants() {
+		if p.Identity() == movedParticipant.Identity() {
+			continue
+		}
+		otherParticipants = append(otherParticipants, p.ToProto())
+	}
+
+	if err := movedParticipant.SendRoomMovedResponse(&livekit.RoomMovedResponse{
+		Room:              destRoom.ToProto(),
+		Token:             token,
+		Participant:       movedParticipant.ToProto(),
+		OtherParticipants: otherParticipants,
+	}); err != nil {
+		pLogger.Warnw("could not send room moved response", err)
+	}
+
+	return &livekit.MoveParticipantResponse{}, nil
+}
+
+// resolveDestinationRoomForMove returns a held *rtc.Room for destRoomName that is guaranteed to
+// be local to this node, creating and self-pinning it if it doesn't exist anywhere yet (subject
+// to auto-create being enabled, same as an ordinary implicit room join). If the room already
+// exists on a different node, it returns ErrMoveCrossNodeNotSupported: cross-node moves would
+// require migrating the participant's live media session between server processes, which this
+// repo does not implement. The caller is responsible for calling Release() on the returned room.
+func (r *RoomManager) resolveDestinationRoomForMove(ctx context.Context, destRoomName livekit.RoomName) (*rtc.Room, error) {
+	node, err := r.router.GetNodeForRoom(ctx, destRoomName)
+	switch {
+	case errors.Is(err, routing.ErrNotFound):
+		if !r.roomAllocator.AutoCreateEnabled(ctx) {
+			return nil, ErrRoomNotFound
+		}
+		// Destination room does not exist anywhere yet. This node is already handling the
+		// move (it hosts the source participant), so claim the destination room for this
+		// node too, keeping the move same-node. SetNodeForRoom is not a compare-and-swap, so
+		// this has the same accepted race as ordinary concurrent room auto-creation: if
+		// another node concurrently claims the same not-yet-existing room name, the last
+		// SetNodeForRoom call wins.
+		if err := r.roomAllocator.SelectRoomNode(ctx, destRoomName, r.currentNode.NodeID()); err != nil {
+			return nil, err
+		}
+	case err != nil:
+		return nil, err
+	case livekit.NodeID(node.Id) != r.currentNode.NodeID():
+		return nil, ErrMoveCrossNodeNotSupported
+	}
+
+	return r.getOrCreateRoom(ctx, &livekit.CreateRoomRequest{Name: string(destRoomName)})
+}
+
+// moveParticipantToRoom swaps a participant's listener/telemetry-listener/helper and rewrites
+// its grants to point at room, via the existing (previously orphaned) ParticipantImpl.MoveToRoom
+// primitive. It does not touch the participant's signaling connection or peer connections, and
+// does not add the participant to room's own bookkeeping -- callers must also call
+// room.AddParticipantForMove.
+func (r *RoomManager) moveParticipantToRoom(room *rtc.Room, participant types.LocalParticipant) {
+	participant.MoveToRoom(types.MoveToRoomParams{
+		RoomName:          room.Name(),
+		ParticipantID:     livekit.ParticipantID(guid.New(utils.ParticipantPrefix)),
+		Listener:          room.LocalParticipantListener(),
+		TelemetryListener: room.ParticipantTelemetryListener(),
+		Helper: &roomManagerParticipantHelper{
+			room:                     room,
+			codecRegressionThreshold: r.config.Video.CodecRegressionThreshold,
+		},
+	})
+}
+
+// bindMovedParticipant re-establishes the per-room bookkeeping that StartSession normally wires
+// up at initial join time (RPC topic registration, roomStore persistence, telemetry, and the
+// AddOnClose cleanup callback), for a participant that has just been moved into room.
+// ParticipantImpl.MoveToRoom fires and clears the participant's previously registered onClose
+// callbacks as part of the move, so without re-registering here, the topic registrations,
+// roomStore cleanup, and ParticipantLeft telemetry for the new room would never fire once the
+// participant eventually actually disconnects.
+func (r *RoomManager) bindMovedParticipant(ctx context.Context, room *rtc.Room, participant types.LocalParticipant) {
+	pLogger := participant.GetLogger()
+
+	var participantServerClosers utils.Closers
+	participantTopic := rpc.FormatParticipantTopic(room.Name(), participant.Identity())
+	participantServer := must.Get(rpc.NewTypedParticipantServer(r, r.bus))
+	participantServerClosers = append(participantServerClosers, utils.CloseFunc(r.participantServers.Replace(participantTopic, participantServer)))
+	if err := participantServer.RegisterAllParticipantTopics(participantTopic); err != nil {
+		pLogger.Errorw("could not register participant topic after move", err, "room", room.Name())
+	}
+
+	if err := r.roomStore.StoreParticipant(ctx, room.Name(), participant.ToProto()); err != nil {
+		pLogger.Errorw("could not store moved participant", err)
+	}
+
+	persistRoomForParticipantCount := func(proto *livekit.Room) {
+		if !participant.Hidden() && !room.IsClosed() {
+			if err := r.roomStore.StoreRoom(ctx, proto, room.Internal()); err != nil {
+				logger.Errorw("could not store room", err)
+			}
+		}
+	}
+	persistRoomForParticipantCount(room.ToProto())
+
+	clientMeta := &livekit.AnalyticsClientMeta{Region: r.currentNode.Region(), Node: string(r.currentNode.NodeID())}
+	r.telemetry.ParticipantJoined(ctx, room.ToProto(), participant.ToProto(), participant.GetClientInfo(), clientMeta, true, participant.TelemetryGuard())
+
+	participant.AddOnClose(types.ParticipantCloseKeyNormal, func(p types.LocalParticipant) {
+		participantServerClosers.Close()
+
+		if err := r.roomStore.DeleteParticipant(ctx, room.Name(), p.Identity()); err != nil {
+			pLogger.Errorw("could not delete participant", err)
+		}
+
+		proto := room.ToProto()
+		persistRoomForParticipantCount(proto)
+		r.telemetry.ParticipantLeft(ctx, proto, p.ToProto(), true, p.TelemetryGuard())
+	})
 }
 
 func (r *RoomManager) PerformRpc(ctx context.Context, req *livekit.PerformRpcRequest) (*livekit.PerformRpcResponse, error) {
@@ -1153,10 +1343,13 @@ func (r *RoomManager) iceServersForParticipant(apiKey string, participant types.
 	return iceServers
 }
 
-func (r *RoomManager) refreshToken(participant types.LocalParticipant) error {
+// buildParticipantToken mints a token for the participant's current grants (as returned by
+// ClaimGrants), preserving the original token's remaining validity. Used both to refresh a
+// participant's token in place, and to hand a moved participant a token for its new room.
+func (r *RoomManager) buildParticipantToken(participant types.LocalParticipant) (string, error) {
 	key, secret, err := r.getFirstKeyPair()
 	if err != nil {
-		return err
+		return "", err
 	}
 
 	grants := participant.ClaimGrants()
@@ -1179,15 +1372,15 @@ func (r *RoomManager) refreshToken(participant types.LocalParticipant) error {
 		SetVideoGrant(grants.Video).
 		SetRoomConfig(grants.GetRoomConfiguration()).
 		SetRoomPreset(grants.RoomPreset)
-	jwt, err := token.ToJWT()
-	if err == nil {
-		err = participant.SendRefreshToken(jwt)
-	}
+	return token.ToJWT()
+}
+
+func (r *RoomManager) refreshToken(participant types.LocalParticipant) error {
+	jwt, err := r.buildParticipantToken(participant)
 	if err != nil {
 		return err
 	}
-
-	return nil
+	return participant.SendRefreshToken(jwt)
 }
 
 func (r *RoomManager) setIceConfig(roomName livekit.RoomName, participant types.LocalParticipant) *livekit.ICEConfig {

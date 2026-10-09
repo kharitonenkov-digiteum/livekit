@@ -1502,6 +1502,200 @@ func (r *Room) RemoveParticipant(
 	}
 }
 
+// RemoveParticipantForMove detaches a participant from this room's bookkeeping as part of
+// MoveParticipant, without touching its signaling connection or peer connections (unlike
+// RemoveParticipant, which is used when a participant is actually leaving for good). Returns
+// the participant, its registered signal request source, and its original subscribe options so
+// the caller can hand them to AddParticipantForMove on the destination room; returns a nil
+// participant if it is no longer a member of this room.
+func (r *Room) RemoveParticipantForMove(identity livekit.ParticipantIdentity) (types.LocalParticipant, routing.MessageSource, *ParticipantOptions) {
+	r.lock.Lock()
+	p, ok := r.participants[identity]
+	if !ok {
+		r.lock.Unlock()
+		return nil, nil, nil
+	}
+
+	requestSource := r.participantRequestSources[identity]
+	opts := r.participantOpts[identity]
+	agentJob := r.agentParticpants[identity]
+
+	delete(r.participants, identity)
+	delete(r.participantOpts, identity)
+	delete(r.participantRequestSources, identity)
+	delete(r.hasPublished, identity)
+	delete(r.launchedTrackEgresses, identity)
+	delete(r.agentParticpants, identity)
+	if !p.Hidden() {
+		r.protoRoom.NumParticipants--
+	}
+
+	immediateChange := false
+	if p.IsRecorder() {
+		activeRecording := false
+		for _, op := range r.participants {
+			if op.IsRecorder() {
+				activeRecording = true
+				break
+			}
+		}
+		if r.protoRoom.ActiveRecording != activeRecording {
+			r.protoRoom.ActiveRecording = activeRecording
+			immediateChange = true
+		}
+	}
+	r.lock.Unlock()
+	r.protoProxy.MarkDirty(immediateChange)
+
+	// clear this room's visibility of the participant's published tracks; the tracks
+	// themselves move with the participant into the destination room.
+	for _, t := range p.GetPublishedTracks() {
+		r.trackManager.RemoveTrack(t)
+	}
+	for _, t := range p.GetPublishedDataTracks() {
+		r.trackManager.RemoveDataTrack(t)
+	}
+
+	if agentJob != nil {
+		agentJob.participantLeft()
+		go func() {
+			if _, err := r.agentClient.TerminateJob(context.Background(), agentJob.Id, rpc.JobTerminateReason_AGENT_LEFT_ROOM); err != nil {
+				r.logger.Infow("failed sending TerminateJob RPC", "error", err, "jobID", agentJob.Id, "participant", identity)
+			}
+		}()
+	}
+
+	r.leftAt.Store(time.Now().Unix())
+
+	if r.onParticipantChanged != nil {
+		r.onParticipantChanged(p)
+	}
+	r.broadcastParticipantState(p, broadcastOptions{skipSource: true})
+
+	return p, requestSource, opts
+}
+
+// AddParticipantForMove attaches an already-connected participant (arriving via MoveParticipant)
+// to this room's bookkeeping. Unlike Join, it does not perform ICE negotiation or send a join
+// response -- the caller is responsible for notifying the client via SendRoomMovedResponse. It
+// also does not launch egress for the participant's already-published tracks, since those tracks
+// were not published while the participant was a member of this room.
+func (r *Room) AddParticipantForMove(p types.LocalParticipant, opts *ParticipantOptions, requestSource routing.MessageSource) error {
+	r.lock.Lock()
+
+	if r.IsClosed() {
+		r.lock.Unlock()
+		return ErrRoomClosed
+	}
+
+	if r.participants[p.Identity()] != nil {
+		r.lock.Unlock()
+		return ErrAlreadyJoined
+	}
+
+	if r.protoRoom.MaxParticipants > 0 && !p.IsDependent() {
+		numParticipants := uint32(0)
+		for _, op := range r.participants {
+			if !op.IsDependent() {
+				numParticipants++
+			}
+		}
+		if numParticipants >= r.protoRoom.MaxParticipants {
+			r.lock.Unlock()
+			return ErrMaxParticipantsExceeded
+		}
+	}
+
+	if r.FirstJoinedAt() == 0 && !p.IsDependent() {
+		r.joinedAt.Store(time.Now().Unix())
+	}
+
+	r.launchTargetAgents(slices.Collect(maps.Values(r.agentDispatches)), p, livekit.JobType_JT_PARTICIPANT)
+
+	r.logger.Debugw(
+		"participant moved in",
+		"participantID", p.ID(),
+		"participant", p.Identity(),
+		"numParticipants", len(r.participants),
+	)
+
+	if p.IsRecorder() && !r.protoRoom.ActiveRecording {
+		r.protoRoom.ActiveRecording = true
+		r.protoProxy.MarkDirty(true)
+	} else {
+		r.protoProxy.MarkDirty(false)
+	}
+
+	r.participants[p.Identity()] = p
+	r.participantOpts[p.Identity()] = opts
+	if requestSource != nil {
+		r.participantRequestSources[p.Identity()] = requestSource
+	}
+	r.lock.Unlock()
+
+	if r.onParticipantChanged != nil {
+		r.onParticipantChanged(p)
+	}
+	r.broadcastParticipantState(p, broadcastOptions{skipSource: true})
+
+	// re-announce tracks the participant published while in its previous room: this room's
+	// listener was only wired up by MoveToRoom for *future* publish events, so already-published
+	// tracks need to be surfaced explicitly. Egress is intentionally not (re-)launched for them.
+	for _, t := range p.GetPublishedTracks() {
+		r.addExistingTrackForMove(p, t)
+	}
+	for _, t := range p.GetPublishedDataTracks() {
+		r.addExistingDataTrackForMove(p, t)
+	}
+
+	// subscribe the moved-in participant to this room's existing publishers
+	r.subscribeToExistingTracks(p, false)
+
+	return nil
+}
+
+// addExistingTrackForMove mirrors onTrackPublished (subscribing this room's existing
+// participants to the track), minus its egress-launch side effects, for a track that was
+// already published before the participant moved into this room.
+func (r *Room) addExistingTrackForMove(participant types.Participant, track types.MediaTrack) {
+	r.trackManager.AddTrack(track, participant.Identity(), participant.ID())
+
+	r.lock.RLock()
+	defer r.lock.RUnlock()
+	for _, existingParticipant := range r.participants {
+		if existingParticipant == participant {
+			continue
+		}
+		if existingParticipant.State() != livekit.ParticipantInfo_ACTIVE {
+			continue
+		}
+		if !r.autoSubscribe(existingParticipant) {
+			continue
+		}
+		existingParticipant.SubscribeToTrack(track.ID(), false)
+	}
+}
+
+// addExistingDataTrackForMove is the data-track counterpart of addExistingTrackForMove.
+func (r *Room) addExistingDataTrackForMove(participant types.Participant, dt types.DataTrack) {
+	r.trackManager.AddDataTrack(dt, participant.Identity(), participant.ID())
+
+	r.lock.RLock()
+	defer r.lock.RUnlock()
+	for _, existingParticipant := range r.participants {
+		if existingParticipant == participant {
+			continue
+		}
+		if existingParticipant.State() != livekit.ParticipantInfo_ACTIVE {
+			continue
+		}
+		if !r.autoSubscribeDataTrack(existingParticipant) {
+			continue
+		}
+		existingParticipant.SubscribeToDataTrack(dt.ID())
+	}
+}
+
 func (r *Room) subscribeToExistingTracks(p types.LocalParticipant, isSync bool) {
 	r.lock.RLock()
 	autoSubscribe := r.autoSubscribe(p)

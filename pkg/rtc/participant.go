@@ -4371,8 +4371,14 @@ func (p *ParticipantImpl) LeaveSession(leave func()) {
 	p.telemetryGuard = &telemetry.ReferenceGuard{}
 	p.lock.Unlock()
 
-	p.params.LoggerResolver.Reset()
-	p.params.ReporterResolver.Reset()
+	// self-hosted does not populate these (they're left to the caller, e.g. Cloud's control
+	// plane); nothing to reset when there's no resolver to begin with.
+	if p.params.LoggerResolver != nil {
+		p.params.LoggerResolver.Reset()
+	}
+	if p.params.ReporterResolver != nil {
+		p.params.ReporterResolver.Reset()
+	}
 }
 
 // JoinSession takes the participant, after LeaveSession, into the session its current
